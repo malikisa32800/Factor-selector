@@ -1,0 +1,101 @@
+# import relevant packages
+import bql
+import pandas as pd
+import ipywidgets as widgets
+import bqwidgets as bqw
+import plotly.express as px
+import plotly.graph_objs as go
+import ipydatagrid as ipdg
+
+bq = bql.Service()
+
+# Create Function to get data using BQL and put into a datagrid
+def get_data(ticker):
+
+    # define universe and all fields
+    univ = bq.univ.members(ticker)
+    fields = {
+    'EPS' : bq.data.is_eps()['Value'],
+    'Total Equity to Market Cap' : bq.data.tot_common_eqy()['Value'] / bq.data.cur_mkt_cap()['Value']*100,
+    'Sales Growth' : bq.data.sales_growth()['Value'],
+    '5 Year CAGR Total Equity' : bq.data.tot_common_eqy(fpt='A',fpo=bq.func.range('-4','0'))['Value'].cgr()*100,
+    '1 Month Price Change' : (bq.data.px_last()['Value'] / bq.data.px_last(dates='-1m')['Value'].dropna().first()-1)*100,
+    '6M Total Return' : bq.data.total_return(calc_interval='6M')['Value']*100,
+    }
+    
+    # filter all fields from original dictionary to extract only selected factor for each style from dropdown and insert into new dictionary along with gics sector field
+    extract_fields = [value_factor.value,growth_factor.value,momentum_factor.value]
+    extracted_fields = {'GICS Sector Name' : bq.data.gics_sector_name()}
+    for key,value in fields.items():
+        if key in extract_fields:
+            extracted_fields[key] = value
+    
+    # request,execute, and create dataframe of universe and filtered fields
+    request = bql.Request(univ,extracted_fields,with_params={'fill':'prev'})
+    response = bq.execute(request)
+    df = pd.concat([r.df() for r in response],axis=1)
+    
+    #create stats needed for cross sectional z score across stock vs sector
+    avg = df.groupby('GICS Sector Name').mean()
+    std = df.groupby('GICS Sector Name').std()
+    df1 = pd.merge(df,avg,how='outer',left_on = 'GICS Sector Name',right_index=True,suffixes=('', ' Sector Average'))
+    df2 = pd.merge(df1,std,how='outer',left_on = 'GICS Sector Name',right_index=True,suffixes=('', ' Sector STD'))
+
+    # for loop to add new column for zscore of each factor for each security
+    for r in extract_fields:
+        df2[f'{r} Zscore'] = ((df2[r] - df2[f'{r} Sector Average']) /df2[f'{r} Sector STD'])
+
+    # manipulate dataframe to just have each member and their respective zscore column per each factor utilizing .loc method to call factor columns zscore
+    # remove securities that dont have values within all 3 factor 
+    # average of all rows to get composite score and sort values and get top 20 using an higher is better logic
+    # create final dataframe with ticker, sector, and composite score
+    df3 = df2.loc[:,[f'{r} Zscore' for r in extract_fields]]
+    pd.options.mode.chained_assignment = None #remove setting with copy warning for chained indexing
+    df4 = df3.dropna(thresh=3)
+    df4['Composite Score'] = df4.mean(axis=1)
+    df4 = df4.sort_values('Composite Score',ascending=False).head(20).round(2)
+    final_df = pd.merge(df2['GICS Sector Name'],df4['Composite Score'],how='inner',left_index=True,right_index=True).sort_values('Composite Score',ascending=False)
+    return final_df
+
+# Create function to create data grid
+def get_grid(df):
+        df = get_data(ticker.value)
+        data_grid = ipdg.DataGrid(df,column_widths={'ID':120,'GICS Sector Name':150,'Composite Score':125},)
+        return data_grid
+
+
+# Create function to display bar chart
+def get_chart(df):
+    dff = get_data(ticker.value)
+    df = dff.groupby('GICS Sector Name').count()
+    colors = ['red','blue','yellow','orange','purple','green','brown','aqua','darkorchid','olive','tan']
+    fig = go.Figure(go.Bar(x=df.index,y=df['Composite Score'],marker_color=colors))
+    fig.update_layout(title=f'{ticker.value} ',yaxis=dict(gridwidth=2,gridcolor='#2F2F2F',griddash='dash'),template="plotly_dark")
+    fig_widget = go.FigureWidget(fig)
+    return fig_widget
+
+
+#create function for updating chart and grid for event handler
+def update_grid_chart(change):
+    df = get_data(ticker.value)
+    data_grid = get_grid(df)
+    fig = get_chart(df)
+    fig_shell.children = [fig]
+    grid_shell.children = [data_grid]
+    
+    
+
+# create widgets for ticker input, and selection of value,growth,momentum factor,button
+ticker = widgets.Text(value='SXXP Index',description='Index:')
+value_factor = widgets.Dropdown(options=['EPS','Total Equity to Market Cap'],value='EPS',description='Value Factor',style={'description_width': 'initial'})
+growth_factor = widgets.Dropdown(options=['Sales Growth','5 Year CAGR Total Equity'],value='Sales Growth',description='Growth Factor',style={'description_width': 'initial'})
+momentum_factor = widgets.Dropdown(options=['1 Month Price Change','6M Total Return'],value='1 Month Price Change',description='Momentum Factor',style={'description_width': 'initial'})
+fig_shell = widgets.HBox([])
+grid_shell = widgets.HBox([])
+button = widgets.Button(description='Run',button_style='success')
+button.on_click(update_grid_chart)
+
+# Create UI
+hbox = widgets.HBox([ticker,value_factor,growth_factor,momentum_factor])
+vbox = widgets.VBox([hbox,button,grid_shell,fig_shell])
+vbox
